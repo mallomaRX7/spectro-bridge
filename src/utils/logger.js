@@ -1,15 +1,16 @@
 const winston = require('winston');
 const path = require('path');
 const fs = require('fs');
-const { app } = require('electron');
+const os = require('os');
 
-// Get the proper app data directory (works in packaged app)
+// Get logs directory - use home directory for packaged app
 const getLogsDir = () => {
-  const userDataPath = app.getPath('userData');
-  return path.join(userDataPath, 'logs');
+  const baseDir = path.join(os.homedir(), '.spectro-bridge');
+  const logsDir = path.join(baseDir, 'logs');
+  return logsDir;
 };
 
-// Ensure logs directory exists
+// Ensure logs directory exists before Winston tries to use it
 const logsDir = getLogsDir();
 if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
@@ -39,7 +40,7 @@ const logger = winston.createLogger({
     }),
     new winston.transports.File({
       filename: path.join(logsDir, 'spectro-bridge.log'),
-      maxsize: 5242880, // 5MB
+      maxsize: 5242880,
       maxFiles: 5
     }),
     new winston.transports.File({
