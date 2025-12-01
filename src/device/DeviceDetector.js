@@ -77,13 +77,9 @@ class DeviceDetector extends EventEmitter {
     const spotreadPath = path.join(argyllPath, 'spotread');
     
     return new Promise((resolve) => {
-      // Use timeout to run spotread briefly - it shows device info before prompting
-      // timeout kills the process after 3 seconds, avoiding TTY issues
-      const cmd = `timeout 3 "${spotreadPath}" -c 1 2>&1 || true`;
-      
-      logger.info(`Running detection command: ${cmd}`);
-      
-      exec(cmd, { timeout: 10000 }, (error, stdout, stderr) => {
+      // Start spotread and kill after 3 seconds to capture initial device output
+      // macOS doesn't have timeout command, use exec with setTimeout kill
+      const child = exec(`"${spotreadPath}" -c 1 2>&1`, { timeout: 5000 }, (error, stdout, stderr) => {
         const output = stdout + (stderr || '');
         
         logger.info('=== spotread detection output ===');
@@ -116,6 +112,14 @@ class DeviceDetector extends EventEmitter {
         
         resolve();
       });
+      
+      // Kill spotread after 3 seconds - device info appears immediately
+      setTimeout(() => {
+        if (!child.killed) {
+          logger.info('Killing spotread detection process after 3s');
+          child.kill('SIGTERM');
+        }
+      }, 3000);
     });
   }
   

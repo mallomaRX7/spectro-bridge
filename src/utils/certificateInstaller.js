@@ -176,22 +176,40 @@ class CertificateInstaller {
 
   /**
    * Check if certificate already exists in System keychain and is trusted
+   * Uses security verify-cert which is more reliable than dump-trust-settings
    */
   async checkIfAlreadyTrusted() {
+    const certPath = this.getCertPath();
+    
     return new Promise((resolve) => {
+      // First check if cert exists in System keychain
       exec('security find-certificate -c localhost /Library/Keychains/System.keychain 2>&1', (error, stdout) => {
-        if (!error && stdout.includes('localhost')) {
-          logger.info('Certificate found in System keychain, checking trust...');
-          // Check trust settings
-          exec('security dump-trust-settings -d 2>&1', (err2, trustOutput) => {
-            const trusted = trustOutput && trustOutput.includes('localhost');
-            logger.info(`Certificate trust status: ${trusted ? 'trusted' : 'not trusted'}`);
-            resolve(trusted);
-          });
-        } else {
+        if (error || !stdout.includes('localhost')) {
           logger.info('Certificate not found in System keychain');
           resolve(false);
+          return;
         }
+        
+        logger.info('Certificate found in System keychain, verifying trust...');
+        
+        // Verify the cert is trusted using verify-cert
+        exec(`security verify-cert -c "${certPath}" -p ssl -s localhost 2>&1`, (verifyError, verifyOut) => {
+          const output = verifyOut || '';
+          
+          // If verify-cert exits with 0 and no trust errors, cert is trusted
+          if (!verifyError) {
+            logger.info('Certificate is trusted (verify-cert passed)');
+            resolve(true);
+          } else if (output.includes('CSSMERR_TP_NOT_TRUSTED') || 
+                     output.includes('CSSMERR_APPLETP_SSL_HOSTNAME_MISMATCH')) {
+            logger.info('Certificate not trusted (trust error detected)');
+            resolve(false);
+          } else {
+            // Other errors (self-signed warnings) are OK if cert is in System keychain
+            logger.info('Certificate appears trusted (in System keychain, no trust errors)');
+            resolve(true);
+          }
+        });
       });
     });
   }
