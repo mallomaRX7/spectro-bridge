@@ -98,6 +98,7 @@ class CertificateInstaller {
 
   /**
    * Install certificate to system keychain (macOS only)
+   * Always removes existing certificate first to ensure clean install
    * Returns true if installed, false if user cancelled
    */
   async installCertificate() {
@@ -119,7 +120,7 @@ class CertificateInstaller {
       type: 'info',
       title: 'SSL Certificate Installation',
       message: 'Spectro Bridge needs to install a local SSL certificate',
-      detail: 'This allows secure WebSocket connections from your browser.\n\nYou will be prompted for your administrator password twice:\n1. To remove any old certificate\n2. To install and trust the new certificate\n\nThis is a one-time setup.',
+      detail: 'This allows secure WebSocket connections from your browser.\n\nYou will be prompted for your administrator password to install and trust the certificate.\n\nThis is a one-time setup.',
       buttons: ['Install Certificate', 'Skip (Manual Setup Required)'],
       defaultId: 0,
       cancelId: 1
@@ -131,19 +132,22 @@ class CertificateInstaller {
     }
 
     // Step 1: Remove any existing localhost certificate
-    await this.removeExistingCertificate();
+    logger.info('Removing any existing localhost certificates...');
+    await new Promise((resolve) => {
+      const removeCmd = `osascript -e 'do shell script "security delete-certificate -c localhost /Library/Keychains/System.keychain 2>/dev/null || true" with administrator privileges'`;
+      exec(removeCmd, { timeout: 30000 }, () => resolve());
+    });
 
-    // Step 2: Install the new certificate with trust
+    // Step 2: Add certificate with trust settings
+    logger.info('Installing certificate with Always Trust...');
     return new Promise((resolve) => {
-      // Use osascript to get admin privileges for adding to System Keychain with trust
-      const command = `osascript -e 'do shell script "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \\"${certPath}\\"" with administrator privileges'`;
+      const addCmd = `osascript -e 'do shell script "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \\"${certPath}\\"" with administrator privileges'`;
       
-      exec(command, async (error, stdout, stderr) => {
+      exec(addCmd, { timeout: 30000 }, (error, stdout, stderr) => {
         if (error) {
           logger.error('Certificate installation failed:', error.message);
           logger.error('stderr:', stderr);
           
-          // Show error dialog with manual instructions
           dialog.showMessageBox({
             type: 'error',
             title: 'Certificate Installation Failed',
@@ -154,22 +158,13 @@ class CertificateInstaller {
           
           resolve(false);
         } else {
-          logger.info('Certificate installed successfully');
-          
-          // Step 3: Open browser to establish first-visit trust
-          logger.info('Opening browser for initial certificate acceptance...');
-          
-          // Wait a moment for the server to be ready
-          await new Promise(r => setTimeout(r, 1000));
-          
-          // Open the localhost URL in default browser
-          shell.openExternal('https://localhost:9876');
+          logger.info('Certificate installed successfully with Always Trust');
           
           dialog.showMessageBox({
             type: 'info',
             title: 'Certificate Installed',
             message: 'SSL certificate installed successfully',
-            detail: 'A browser window has opened to complete the setup.\n\nIf you see a security warning, click "Advanced" and "Proceed to localhost".\n\nYou can now connect securely from your browser.',
+            detail: 'The certificate has been installed and set to Always Trust.\n\nA browser window will open shortly to complete the setup.',
             buttons: ['OK']
           });
           
@@ -182,6 +177,7 @@ class CertificateInstaller {
   /**
    * Check and install certificate if needed
    * Call this during app initialization
+   * Always ensures fresh certificate installation for reliability
    */
   async ensureCertificateTrusted() {
     if (this.platform !== 'darwin') {
@@ -189,17 +185,26 @@ class CertificateInstaller {
       return true;
     }
 
-    logger.info('Checking if SSL certificate is trusted...');
+    logger.info('Ensuring SSL certificate is properly installed...');
     
-    const isTrusted = await this.isCertTrusted();
-    
-    if (isTrusted) {
-      logger.info('Certificate is already trusted');
-      return true;
+    const certPath = this.getCertPath();
+    if (!this.certExists()) {
+      logger.error('Certificate file not found');
+      return false;
     }
-
-    logger.info('Certificate not trusted, attempting installation...');
-    return await this.installCertificate();
+    
+    // Always try to install/update the certificate for reliability
+    const installed = await this.installCertificate();
+    
+    if (installed) {
+      // Open browser to establish first-visit trust
+      logger.info('Opening browser for certificate acceptance...');
+      setTimeout(() => {
+        shell.openExternal('https://localhost:9876');
+      }, 2000);
+    }
+    
+    return installed;
   }
 }
 

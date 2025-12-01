@@ -62,11 +62,11 @@ class DeviceDetector extends EventEmitter {
   }
 
   /**
-   * Detect already-connected devices using spotread -?
+   * Detect already-connected devices using spotread enumeration
    * This doesn't hold USB handles like getDeviceList() does
    */
   async detectDevicesWithSpotread() {
-    logger.info('Detecting devices using spotread -?');
+    logger.info('Detecting devices using spotread enumeration');
     
     const argyllPath = config.getArgyllPath();
     if (!argyllPath) {
@@ -77,42 +77,52 @@ class DeviceDetector extends EventEmitter {
     const spotreadPath = path.join(argyllPath, 'spotread');
     
     return new Promise((resolve) => {
-      // spotread -? lists available devices
-      exec(`"${spotreadPath}" -? 2>&1`, { timeout: 10000 }, (error, stdout, stderr) => {
+      // Run spotread briefly - it lists devices at startup
+      // Send 'q' immediately to quit after device enumeration
+      exec(`echo "q" | "${spotreadPath}" -c 1 2>&1`, { timeout: 15000 }, (error, stdout, stderr) => {
         const output = stdout + stderr;
         
-        // Parse device list from output
-        // Format: "N = 'usbXX: (Device Name)'" 
-        // Example: "1 = 'usb17: (X-Rite i1 Pro 2)'"
-        const devicePattern = /(\d+)\s*=\s*'[^']*\(([^)]+)\)'/g;
-        let match;
+        logger.info('=== spotread detection output ===');
+        logger.info(output.substring(0, 1500));
+        
         let foundDevices = 0;
         
-        while ((match = devicePattern.exec(output)) !== null) {
-          const portNumber = parseInt(match[1]);
-          const deviceName = match[2];
-          
-          logger.info(`Found device via spotread: ${deviceName} (port ${portNumber})`);
-          
-          // Check if it's an i1Pro device
-          if (deviceName.toLowerCase().includes('i1 pro') || 
-              deviceName.toLowerCase().includes('i1pro')) {
-            
-            // Determine product ID from name
-            let productId = 0x2001; // Default i1Pro2
-            if (deviceName.includes('Pro 3') || deviceName.includes('Pro3')) {
-              productId = 0x2007;
-            } else if (deviceName === 'i1 Pro' || deviceName === 'i1Pro') {
-              productId = 0x2000; // Original i1Pro
-            }
-            
+        // Pattern 1: "Setting device to 'X-Rite i1 Pro 2'"
+        const settingMatch = output.match(/Setting.*?(?:device|instrument)\s+to\s+'([^']+)'/i);
+        if (settingMatch) {
+          const deviceName = settingMatch[1];
+          logger.info(`Found device (pattern 1): ${deviceName}`);
+          if (this.emitI1ProDevice(deviceName)) {
             foundDevices++;
-            logger.info(`Emitting device:attached for ${deviceName}`);
+          }
+        }
+        
+        // Pattern 2: "N = 'usbXX: (Device Name)'"
+        if (foundDevices === 0) {
+          const portPattern = /(\d+)\s*=\s*'[^']*\(([^)]+)\)'/g;
+          let match;
+          while ((match = portPattern.exec(output)) !== null) {
+            const portNumber = parseInt(match[1]);
+            const deviceName = match[2];
+            logger.info(`Found device (pattern 2): ${deviceName} (port ${portNumber})`);
+            if (this.emitI1ProDevice(deviceName, portNumber)) {
+              foundDevices++;
+            }
+          }
+        }
+        
+        // Pattern 3: Any mention of i1 Pro in output
+        if (foundDevices === 0) {
+          const i1Match = output.match(/i1\s*Pro\s*(\d)?/i);
+          if (i1Match) {
+            const gen = i1Match[1] || '2';
+            logger.info(`Found i1 Pro mention (pattern 3): gen ${gen}`);
             this.emit('device:attached', {
-              vendorId: 0x0971, // X-Rite vendor ID
-              productId,
-              deviceAddress: portNumber
+              vendorId: 0x0971,
+              productId: gen === '3' ? 0x2007 : (gen === '2' ? 0x2001 : 0x2000),
+              deviceAddress: 1
             });
+            foundDevices++;
           }
         }
         
@@ -125,6 +135,30 @@ class DeviceDetector extends EventEmitter {
         resolve();
       });
     });
+  }
+  
+  /**
+   * Helper to emit i1Pro device if detected
+   */
+  emitI1ProDevice(deviceName, portNumber = 1) {
+    const nameLower = deviceName.toLowerCase();
+    if (nameLower.includes('i1 pro') || nameLower.includes('i1pro')) {
+      let productId = 0x2001; // Default i1Pro2
+      if (nameLower.includes('pro 3')) {
+        productId = 0x2007;
+      } else if (nameLower === 'i1 pro' || nameLower.match(/i1\s*pro$/)) {
+        productId = 0x2000;
+      }
+      
+      logger.info(`Emitting device:attached for ${deviceName}`);
+      this.emit('device:attached', {
+        vendorId: 0x0971,
+        productId,
+        deviceAddress: portNumber
+      });
+      return true;
+    }
+    return false;
   }
 
   async start() {

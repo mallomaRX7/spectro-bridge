@@ -81,19 +81,22 @@ class SpotreadWrapper extends EventEmitter {
 
   /**
    * Generate expect script for persistent session with hardware button monitoring
-   * Uses fileevent for reliable stdin handling instead of non-blocking polling
+   * Uses blocking stdin in a while loop with expect_background for reliable detection
    */
   generatePersistentExpectScript() {
     return `#!/usr/bin/expect -f
 set timeout 60
 log_user 1
 
+# Track measurement source
+set software_triggered 0
+
 # Start spotread
 spawn ${this.spotreadPath} -c 1 -s
 
-# Wait for calibration prompt
+# === CALIBRATION PHASE ===
 expect {
-  -re "hit any key|Place instrument|press any key|any key to continue|calibration position|white reference" {
+  -re "hit any key|Place instrument|press any key|calibration position|white reference" {
     puts "CALIBRATION_PROMPT_DETECTED"
     send "\\r"
   }
@@ -103,13 +106,13 @@ expect {
   }
 }
 
-# Wait for calibration to complete
 expect {
   -re "Calibration complete" {
     puts "CALIBRATION_COMPLETE"
   }
-  -re "Calibration failed|Hardware Failure" {
+  -re "Calibration failed|Hardware Failure|reading is too low" {
     puts "CALIBRATION_FAILED"
+    puts \$expect_out(0,string)
     exit 1
   }
   timeout {
@@ -118,9 +121,8 @@ expect {
   }
 }
 
-# Wait for ready to measure prompt
 expect {
-  -re "Place instrument on spot|any other key to take a reading|key to read" {
+  -re "any other key|key to read|Place instrument on spot" {
     puts "READY_FOR_MEASUREMENT"
   }
   timeout {
@@ -129,21 +131,49 @@ expect {
   }
 }
 
-# Track if software triggered the measurement
-set software_triggered 0
-
-# Handler for stdin commands - using fileevent for reliable reading
-proc handle_stdin {} {
-  global software_triggered spawn_id
+# === MEASUREMENT PHASE ===
+# Use expect_background to detect results (both software and hardware triggered)
+expect_background {
+  -re "(Result is XYZ:\\s*\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+.*?D50 Lab:\\s*\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+)" {
+    global software_triggered
+    if {\$software_triggered} {
+      puts "SOFTWARE_MEASUREMENT_DETECTED"
+      set software_triggered 0
+    } else {
+      puts "HARDWARE_MEASUREMENT_DETECTED"
+    }
+    puts "MEASUREMENT_RESULT_START"
+    puts \$expect_out(1,string)
+    exp_continue
+  }
   
-  if {[eof stdin]} {
+  -re "Spectrum from (\[^\r\n\]+)\r?\n(\[^\r\n\]+)" {
+    puts "SPECTRAL_DATA:"
+    puts \$expect_out(1,string)
+    puts \$expect_out(2,string)
+    exp_continue
+  }
+  
+  -re "(any other key|key to read|Place instrument on spot)" {
+    puts "MEASUREMENT_RESULT_END"
+    puts "READY_FOR_MEASUREMENT"
+    exp_continue
+  }
+}
+
+# Main stdin loop - BLOCKING reads for reliable command handling
+fconfigure stdin -blocking 1 -buffering line
+
+while {1} {
+  # Block waiting for command from stdin
+  if {[gets stdin cmd] < 0} {
+    # EOF - stdin closed
     puts "STDIN_CLOSED"
     send "q"
     expect eof
     exit 0
   }
   
-  gets stdin cmd
   set cmd [string trim \$cmd]
   
   if {\$cmd eq "MEASURE"} {
@@ -157,48 +187,6 @@ proc handle_stdin {} {
     exit 0
   }
 }
-
-# Set up event-driven stdin reading
-fconfigure stdin -blocking 0 -buffering line
-fileevent stdin readable handle_stdin
-
-# Background pattern matching for measurement results
-expect_background {
-  -re "(Result is XYZ:\\s*\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+.*?D50 Lab:\\s*\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+\\s+\[0-9.\\-\\]+)" {
-    global software_triggered
-    
-    if {\$software_triggered} {
-      puts "SOFTWARE_MEASUREMENT_DETECTED"
-      set software_triggered 0
-    } else {
-      puts "HARDWARE_MEASUREMENT_DETECTED"
-    }
-    puts "MEASUREMENT_RESULT_START"
-    puts \$expect_out(1,string)
-    
-    # Continue matching for spectral data
-    exp_continue
-  }
-  
-  -re "(Spectrum from.*?)\\n(.*?)\\n\\s*(any other key|key to read|Place instrument)" {
-    puts "SPECTRAL_DATA:"
-    puts \$expect_out(1,string)
-    puts \$expect_out(2,string)
-    puts "MEASUREMENT_RESULT_END"
-    puts "READY_FOR_MEASUREMENT"
-  }
-  
-  -re "(any other key|key to read|Place instrument on spot)" {
-    # Ready prompt without spectral (might be after result)
-    if {[string match "*Result is*" \$expect_out(buffer)]} {
-      puts "MEASUREMENT_RESULT_END"
-    }
-    puts "READY_FOR_MEASUREMENT"
-  }
-}
-
-# Keep the script running with event loop
-vwait forever
 `;
   }
 
