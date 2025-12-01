@@ -1,14 +1,19 @@
 const EventEmitter = require('events');
 const { usb } = require('usb');
+const { exec } = require('child_process');
+const path = require('path');
 const { logger } = require('../utils/logger');
+const config = require('../utils/config');
 
 /**
  * Detects USB device connection/disconnection events
  * 
- * IMPORTANT: This class uses hotplug events ONLY - no initial device enumeration.
- * getDeviceList() creates persistent USB handles that conflict with spotread's
- * exclusive device access on macOS. Users must connect devices AFTER app launch
- * or unplug/reconnect if already connected.
+ * Uses two detection methods:
+ * 1. spotread -? at startup to detect already-connected devices
+ * 2. USB hotplug events for devices connected after startup
+ * 
+ * This avoids getDeviceList() which creates USB handles that conflict
+ * with spotread's exclusive device access on macOS.
  */
 class DeviceDetector extends EventEmitter {
   constructor() {
@@ -56,25 +61,92 @@ class DeviceDetector extends EventEmitter {
     });
   }
 
+  /**
+   * Detect already-connected devices using spotread -?
+   * This doesn't hold USB handles like getDeviceList() does
+   */
+  async detectDevicesWithSpotread() {
+    logger.info('Detecting devices using spotread -?');
+    
+    const argyllPath = config.getArgyllPath();
+    if (!argyllPath) {
+      logger.warn('No ArgyllCMS path configured, skipping initial device detection');
+      return;
+    }
+    
+    const spotreadPath = path.join(argyllPath, 'spotread');
+    
+    return new Promise((resolve) => {
+      // spotread -? lists available devices
+      exec(`"${spotreadPath}" -? 2>&1`, { timeout: 10000 }, (error, stdout, stderr) => {
+        const output = stdout + stderr;
+        
+        // Parse device list from output
+        // Format: "N = 'usbXX: (Device Name)'" 
+        // Example: "1 = 'usb17: (X-Rite i1 Pro 2)'"
+        const devicePattern = /(\d+)\s*=\s*'[^']*\(([^)]+)\)'/g;
+        let match;
+        let foundDevices = 0;
+        
+        while ((match = devicePattern.exec(output)) !== null) {
+          const portNumber = parseInt(match[1]);
+          const deviceName = match[2];
+          
+          logger.info(`Found device via spotread: ${deviceName} (port ${portNumber})`);
+          
+          // Check if it's an i1Pro device
+          if (deviceName.toLowerCase().includes('i1 pro') || 
+              deviceName.toLowerCase().includes('i1pro')) {
+            
+            // Determine product ID from name
+            let productId = 0x2001; // Default i1Pro2
+            if (deviceName.includes('Pro 3') || deviceName.includes('Pro3')) {
+              productId = 0x2007;
+            } else if (deviceName === 'i1 Pro' || deviceName === 'i1Pro') {
+              productId = 0x2000; // Original i1Pro
+            }
+            
+            foundDevices++;
+            logger.info(`Emitting device:attached for ${deviceName}`);
+            this.emit('device:attached', {
+              vendorId: 0x0971, // X-Rite vendor ID
+              productId,
+              deviceAddress: portNumber
+            });
+          }
+        }
+        
+        if (foundDevices === 0) {
+          logger.info('No supported devices found via spotread');
+        } else {
+          logger.info(`Found ${foundDevices} supported device(s)`);
+        }
+        
+        resolve();
+      });
+    });
+  }
+
   async start() {
     if (this.monitoring) {
       logger.warn('Device detector already monitoring');
       return;
     }
 
-    logger.info('Starting USB device monitoring (hotplug only)...');
+    logger.info('Starting USB device monitoring...');
     logger.info('node-usb loaded successfully');
     
-    // Set up USB event listeners for hotplug ONLY
-    // NOTE: No initial device scan - devices must be connected AFTER app starts
-    // or unplugged and reconnected if already connected.
-    // This is REQUIRED to avoid USB handle conflicts with spotread on macOS.
+    // Set up USB event listeners for hotplug events
     usb.on('attach', this._onAttach);
     usb.on('detach', this._onDetach);
 
     this.monitoring = true;
     
-    logger.info('USB monitoring started - connect/reconnect device to detect');
+    // Detect already-connected devices using spotread
+    // This doesn't hold USB handles like getDeviceList()
+    await this.detectDevicesWithSpotread();
+    
+    logger.info('USB monitoring started');
   }
 
   async stop() {

@@ -2,7 +2,7 @@ const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { app, dialog } = require('electron');
+const { app, dialog, shell } = require('electron');
 const { logger } = require('./logger');
 
 /**
@@ -34,6 +34,7 @@ class CertificateInstaller {
 
   /**
    * Check if certificate is already trusted (macOS only)
+   * Verifies both that the cert exists in keychain AND is set to Always Trust
    */
   async isCertTrusted() {
     if (this.platform !== 'darwin') {
@@ -43,14 +44,54 @@ class CertificateInstaller {
     const certPath = this.getCertPath();
     
     return new Promise((resolve) => {
-      exec(`security verify-cert -c "${certPath}" 2>&1`, (error, stdout, stderr) => {
-        // If verify-cert succeeds or shows cert is trusted, return true
-        const output = stdout + stderr;
-        if (!error || output.includes('CSSMERR_TP_NOT_TRUSTED') === false) {
-          resolve(true);
-        } else {
+      // First check if cert exists in System keychain
+      exec(`security find-certificate -c localhost /Library/Keychains/System.keychain 2>&1`, (error, stdout, stderr) => {
+        if (error) {
+          logger.info('Certificate not found in System keychain');
           resolve(false);
+          return;
         }
+        
+        // Cert exists, now verify it's trusted
+        exec(`security verify-cert -c "${certPath}" 2>&1`, (verifyError, verifyStdout, verifyStderr) => {
+          const output = verifyStdout + verifyStderr;
+          
+          // Check for trust errors
+          if (output.includes('CSSMERR_TP_NOT_TRUSTED') || 
+              output.includes('CSSMERR_TP_CERT_NOT_VALID_YET') ||
+              output.includes('CSSMERR_TP_CERT_EXPIRED')) {
+            logger.info('Certificate exists but is not trusted');
+            resolve(false);
+          } else {
+            logger.info('Certificate is trusted');
+            resolve(true);
+          }
+        });
+      });
+    });
+  }
+
+  /**
+   * Remove existing localhost certificate from System keychain
+   */
+  async removeExistingCertificate() {
+    if (this.platform !== 'darwin') return;
+    
+    logger.info('Removing any existing localhost certificates...');
+    
+    return new Promise((resolve) => {
+      // Use osascript with admin privileges to remove cert
+      // The exit 0 ensures we don't fail if cert doesn't exist
+      const removeCmd = `osascript -e 'do shell script "security delete-certificate -c localhost /Library/Keychains/System.keychain 2>/dev/null; exit 0" with administrator privileges'`;
+      
+      exec(removeCmd, (error, stdout, stderr) => {
+        if (error) {
+          // User cancelled or other error - that's OK, continue anyway
+          logger.info('Certificate removal skipped or no existing cert');
+        } else {
+          logger.info('Existing certificate removed');
+        }
+        resolve();
       });
     });
   }
@@ -78,7 +119,7 @@ class CertificateInstaller {
       type: 'info',
       title: 'SSL Certificate Installation',
       message: 'Spectro Bridge needs to install a local SSL certificate',
-      detail: 'This allows secure WebSocket connections from your browser.\n\nYou may be prompted for your administrator password.\n\nThis is a one-time setup.',
+      detail: 'This allows secure WebSocket connections from your browser.\n\nYou will be prompted for your administrator password twice:\n1. To remove any old certificate\n2. To install and trust the new certificate\n\nThis is a one-time setup.',
       buttons: ['Install Certificate', 'Skip (Manual Setup Required)'],
       defaultId: 0,
       cancelId: 1
@@ -89,11 +130,15 @@ class CertificateInstaller {
       return false;
     }
 
+    // Step 1: Remove any existing localhost certificate
+    await this.removeExistingCertificate();
+
+    // Step 2: Install the new certificate with trust
     return new Promise((resolve) => {
-      // Use osascript to get admin privileges for adding to System Keychain
+      // Use osascript to get admin privileges for adding to System Keychain with trust
       const command = `osascript -e 'do shell script "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \\"${certPath}\\"" with administrator privileges'`;
       
-      exec(command, (error, stdout, stderr) => {
+      exec(command, async (error, stdout, stderr) => {
         if (error) {
           logger.error('Certificate installation failed:', error.message);
           logger.error('stderr:', stderr);
@@ -110,13 +155,24 @@ class CertificateInstaller {
           resolve(false);
         } else {
           logger.info('Certificate installed successfully');
+          
+          // Step 3: Open browser to establish first-visit trust
+          logger.info('Opening browser for initial certificate acceptance...');
+          
+          // Wait a moment for the server to be ready
+          await new Promise(r => setTimeout(r, 1000));
+          
+          // Open the localhost URL in default browser
+          shell.openExternal('https://localhost:9876');
+          
           dialog.showMessageBox({
             type: 'info',
             title: 'Certificate Installed',
             message: 'SSL certificate installed successfully',
-            detail: 'You can now connect securely from your browser.',
+            detail: 'A browser window has opened to complete the setup.\n\nIf you see a security warning, click "Advanced" and "Proceed to localhost".\n\nYou can now connect securely from your browser.',
             buttons: ['OK']
           });
+          
           resolve(true);
         }
       });
