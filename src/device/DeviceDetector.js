@@ -1,13 +1,14 @@
 const EventEmitter = require('events');
-const { usb, getDeviceList } = require('usb');
+const { usb } = require('usb');
 const { logger } = require('../utils/logger');
 
 /**
  * Detects USB device connection/disconnection events
  * 
- * IMPORTANT: This class is careful to NOT hold references to USB Device objects
- * from getDeviceList(). Holding these references prevents spotread from accessing
- * the device exclusively on macOS.
+ * IMPORTANT: This class uses hotplug events ONLY - no initial device enumeration.
+ * getDeviceList() creates persistent USB handles that conflict with spotread's
+ * exclusive device access on macOS. Users must connect devices AFTER app launch
+ * or unplug/reconnect if already connected.
  */
 class DeviceDetector extends EventEmitter {
   constructor() {
@@ -56,96 +57,24 @@ class DeviceDetector extends EventEmitter {
   }
 
   async start() {
-    console.log('DeviceDetector.start() called');
-    
     if (this.monitoring) {
-      console.log('DeviceDetector: Already monitoring, returning');
       logger.warn('Device detector already monitoring');
       return;
     }
 
-    console.log('DeviceDetector: Starting USB device monitoring...');
-    logger.info('Starting USB device monitoring...');
+    logger.info('Starting USB device monitoring (hotplug only)...');
     logger.info('node-usb loaded successfully');
     
-    // Set up USB event listeners for hotplug
+    // Set up USB event listeners for hotplug ONLY
+    // NOTE: No initial device scan - devices must be connected AFTER app starts
+    // or unplugged and reconnected if already connected.
+    // This is REQUIRED to avoid USB handle conflicts with spotread on macOS.
     usb.on('attach', this._onAttach);
     usb.on('detach', this._onDetach);
 
     this.monitoring = true;
     
-    // Perform initial device scan with immediate handle release
-    // This allows detecting devices connected before app startup
-    await this._initialDeviceScan();
-    
-    logger.info('USB monitoring started - ready for device connections');
-  }
-
-  /**
-   * Scan for already-connected devices at startup
-   * Uses a "scan and forget" approach - enumerate, emit events, release handles immediately
-   */
-  async _initialDeviceScan() {
-    logger.info('Performing initial device scan...');
-    
-    try {
-      // Small delay to let USB subsystem stabilize
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      // Temporarily disable hotplug to avoid double events
-      usb.removeListener('attach', this._onAttach);
-      
-      // Get list of connected devices
-      const devices = getDeviceList();
-      logger.info(`Found ${devices.length} USB devices`);
-      
-      const supportedDevices = [];
-      
-      for (const device of devices) {
-        const vendorId = device.deviceDescriptor.idVendor;
-        const productId = device.deviceDescriptor.idProduct;
-        
-        if (this.isSupportedDevice(vendorId, productId)) {
-          supportedDevices.push({
-            vendorId,
-            productId,
-            deviceAddress: device.deviceAddress
-          });
-        }
-      }
-      
-      logger.info(`Found ${supportedDevices.length} supported spectrophotometer(s)`);
-      
-      // CRITICAL: Release USB handles immediately to prevent conflicts with spotread
-      // unrefHotplugEvents releases internal libusb handles
-      if (typeof usb.unrefHotplugEvents === 'function') {
-        usb.unrefHotplugEvents();
-      }
-      
-      // Wait for handles to be released on macOS
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      // Re-enable hotplug events
-      if (typeof usb.refHotplugEvents === 'function') {
-        usb.refHotplugEvents();
-      }
-      
-      // Re-add attach listener
-      usb.on('attach', this._onAttach);
-      
-      // Now emit events for found devices (after handles are released)
-      for (const deviceInfo of supportedDevices) {
-        logger.info(`Emitting device:attached for ${deviceInfo.vendorId.toString(16)}:${deviceInfo.productId.toString(16)}`);
-        this.emit('device:attached', deviceInfo);
-      }
-      
-    } catch (error) {
-      logger.error('Initial device scan failed:', error);
-      // Ensure listener is re-added even on error
-      if (!this._onAttach) return;
-      usb.removeListener('attach', this._onAttach);
-      usb.on('attach', this._onAttach);
-    }
+    logger.info('USB monitoring started - connect/reconnect device to detect');
   }
 
   async stop() {
